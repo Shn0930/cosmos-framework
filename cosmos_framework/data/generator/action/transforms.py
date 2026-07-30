@@ -19,10 +19,13 @@ from __future__ import annotations
 import torch
 import torchvision.transforms.functional as transforms_F
 
-from cosmos_framework.utils import log
 from cosmos_framework.data.generator.action.action_processing import (
     ActionNormalizer,
     ActionProcessor,
+)
+from cosmos_framework.data.generator.action.droid_gpu_augmentation import (
+    DROID_DEFERRED_AUGMENTATION_KEY,
+    DROID_DEFERRED_LOGICAL_SIZE_KEY,
 )
 from cosmos_framework.data.generator.action.json_formatter import ActionPromptJsonFormatter
 from cosmos_framework.data.generator.action.viewpoint_utils import ViewpointTextInfo
@@ -30,8 +33,9 @@ from cosmos_framework.data.generator.augmentors.duration_fps_text_timestamps imp
 from cosmos_framework.data.generator.augmentors.idle_frames_text_info import IdleFramesTextInfo
 from cosmos_framework.data.generator.augmentors.resolution_text_info import ResolutionTextInfo
 from cosmos_framework.data.generator.augmentors.text_tokenizer import TextTokenizerTransform
-from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
 from cosmos_framework.data.generator.sequence_packing import SequencePlan
+from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
+from cosmos_framework.utils import log
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
 
 
@@ -397,6 +401,9 @@ class VideoResize:
         """
         video = data_dict.get("video")
         assert isinstance(video, torch.Tensor), "video is required for reflection padding"
+        if DROID_DEFERRED_AUGMENTATION_KEY in data_dict:
+            return self._record_deferred_droid_size(data_dict, video, resolution)
+
         h, w = video.shape[-2:]
 
         if resolution is None:
@@ -409,6 +416,49 @@ class VideoResize:
             target_h = int(resolution)
         reflection_pad_to_target(data_dict, self.pad_keys, self.keep_aspect_ratio, target_w, target_h)
 
+        return data_dict
+
+    def _record_deferred_droid_size(
+        self,
+        data_dict: dict,
+        video: torch.Tensor,
+        resolution: str | int | None,
+    ) -> dict:
+        """Record the future composite size without expanding worker tensors."""
+        if video.ndim != 4 or video.shape[0] != 9:
+            raise ValueError(
+                f"Deferred DROID augmentation expects worker video shape [9,T,H,W], got {tuple(video.shape)}."
+            )
+        if "video" not in self.pad_keys:
+            raise ValueError("Deferred DROID augmentation requires 'video' in ActionTransformPipeline.pad_keys.")
+
+        logical_size = data_dict.get(DROID_DEFERRED_LOGICAL_SIZE_KEY)
+        if not isinstance(logical_size, torch.Tensor) or logical_size.numel() != 2:
+            raise ValueError(
+                f"Deferred DROID augmentation requires tensor '{DROID_DEFERRED_LOGICAL_SIZE_KEY}' with two values."
+            )
+        logical_h, logical_w = (int(value) for value in logical_size.reshape(-1).tolist())
+        if logical_h <= 0 or logical_w <= 0:
+            raise ValueError(f"Deferred DROID logical size must be positive, got {(logical_h, logical_w)}.")
+
+        if resolution is None:
+            resolution = get_vision_data_resolution((logical_h, logical_w))
+
+        if self.keep_aspect_ratio:
+            target_w, target_h = find_closest_target_size(logical_h, logical_w, resolution)
+            scaling_ratio = min(target_w / logical_w, target_h / logical_h, 1.0)
+            content_h = int(scaling_ratio * logical_h + 0.5)
+            content_w = int(scaling_ratio * logical_w + 0.5)
+        else:
+            target_w = int(resolution)
+            target_h = int(resolution)
+            content_h = target_h
+            content_w = target_w
+
+        data_dict["image_size"] = torch.tensor(
+            [target_h, target_w, content_h, content_w],
+            dtype=torch.float32,
+        )
         return data_dict
 
     def _log_shapes(self, data_dict: dict, when: str) -> None:

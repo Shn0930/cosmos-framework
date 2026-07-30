@@ -14,14 +14,17 @@ import torch
 import webdataset
 from torch.utils.data.dataloader import default_collate
 
-from cosmos_framework.utils.lazy_config import instantiate
-from cosmos_framework.utils import log
+from cosmos_framework.data.generator.action.droid_gpu_augmentation import (
+    DROID_DEFERRED_AUGMENTATION_KEY,
+)
 from cosmos_framework.model.generator.tokenizers.uniae.frame_math import (
     get_uniae_chunk_frames,
     get_uniae_latent_num_frames,
     normalize_uniae_chunk_frames,
 )
+from cosmos_framework.utils import log
 from cosmos_framework.utils.generator.data_utils import read_positive_int_metadata
+from cosmos_framework.utils.lazy_config import instantiate
 
 _TIMING_KEYS = {"_sample_time", "_aug_time", "_pre_aug_time", "_aug_step_times"}
 _BATCH_TIMING_KEYS = {
@@ -545,6 +548,18 @@ class JointDataLoader(webdataset.WebLoader):
                 T = 1
             else:
                 _, T, H, W = media.shape
+                if DROID_DEFERRED_AUGMENTATION_KEY in data_batch:
+                    image_size = data_batch.get("image_size")
+                    while isinstance(image_size, (list, tuple)) and len(image_size) == 1:
+                        image_size = image_size[0]
+                    if not isinstance(image_size, torch.Tensor) or image_size.numel() < 2:
+                        raise ValueError(
+                            "Deferred DROID augmentation requires image_size metadata "
+                            "for logical post-composition token accounting."
+                        )
+                    flat_image_size = image_size.reshape(-1)
+                    H = int(flat_image_size[0].item())
+                    W = int(flat_image_size[1].item())
 
             latent_h_shape = H // self.tokenizer_spatial_compression_factor
             latent_w_shape = W // self.tokenizer_spatial_compression_factor

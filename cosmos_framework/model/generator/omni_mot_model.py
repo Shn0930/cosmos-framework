@@ -16,18 +16,28 @@ from einops import rearrange
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.nn.modules.module import _IncompatibleKeys
 
-from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
-from cosmos_framework.utils.lazy_config import LazyDict
-from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
-from cosmos_framework.model._base import ImaginaireModel
-from cosmos_framework.utils import log, misc
-from cosmos_framework.utils.count_params import count_params
-from cosmos_framework.utils.timer import Timer
-from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
-from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
 from cosmos_framework.data.generator.action.action_processing import ActionProcessor, get_action_processing_records
+from cosmos_framework.data.generator.action.droid_gpu_augmentation import (
+    DROID_DEFERRED_AUGMENTATION_KEY,
+    DROID_DEFERRED_COLOR_FACTORS_KEY,
+    DROID_DEFERRED_COLOR_ORDER_KEY,
+    DROID_DEFERRED_CROP_KEY,
+    DROID_DEFERRED_FRAME_CHUNK_KEY,
+    DROID_DEFERRED_METADATA_KEYS,
+    apply_deferred_droid_augmentation,
+)
+from cosmos_framework.data.generator.sequence_packing import (
+    PackedSequence,
+    SequencePlan,
+    build_sequence_plans_from_data_batch,
+    pack_input_sequence,
+)
+from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
 from cosmos_framework.data.generator.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
+from cosmos_framework.model._base import ImaginaireModel
+from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
+from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.model.generator.diffusion.rectified_flow import RectifiedFlow
 from cosmos_framework.model.generator.diffusion.samplers.edm import EDMSampler
 from cosmos_framework.model.generator.diffusion.samplers.fixed_step import FixedStepSampler
@@ -44,6 +54,8 @@ from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
 from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
 from cosmos_framework.model.generator.mot.parallelize_vfm_network import parallelize_vfm_network
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
+from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
+from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
 from cosmos_framework.model.generator.utils.data_and_condition import (
     GenerationDataClean,
     GenerationDataNoised,
@@ -63,19 +75,16 @@ from cosmos_framework.model.generator.utils.moe_utils import (
 from cosmos_framework.model.generator.utils.safetensors_loader import (
     load_language_model as load_language_model_safetensors,
 )
-from cosmos_framework.data.generator.sequence_packing import (
-    PackedSequence,
-    SequencePlan,
-    build_sequence_plans_from_data_batch,
-    pack_input_sequence,
-)
-from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
-from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
-from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
+from cosmos_framework.utils import log, misc
+from cosmos_framework.utils.count_params import count_params
+from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution, read_positive_int_metadata
 from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelUpdater
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
+from cosmos_framework.utils.lazy_config import LazyDict
+from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
+from cosmos_framework.utils.timer import Timer
 
 
 class OmniMoTModel(ImaginaireModel):
@@ -192,7 +201,6 @@ class OmniMoTModel(ImaginaireModel):
             log.info(f"Sound tokenizer initialized: {type(self.tokenizer_sound_gen).__name__}")
         else:
             self.tokenizer_sound_gen = None
-
 
     def build_net(self, dtype: torch.dtype, *, lora_enabled: bool | None = None) -> torch.nn.Module:
         # Build model network and parallelize it.
@@ -3475,6 +3483,7 @@ class OmniMoTModel(ImaginaireModel):
                 timer.start()
 
         # Vision (image/video) raw state and tokenized latent state
+        self._apply_deferred_droid_augmentation_inplace(data_batch)
         self._normalize_video_databatch_inplace(data_batch)
         self._augment_image_dim_inplace(data_batch)  # converts each image tensor to (1, C, 1, H, W)
         raw_state_vision = data_batch[self.input_image_key if is_image_batch else self.input_video_key]
@@ -3581,6 +3590,148 @@ class OmniMoTModel(ImaginaireModel):
             raw_action_dim=raw_action_dim,
             control_weights=control_weights,
         )
+
+    def _apply_deferred_droid_augmentation_inplace(self, data_batch: dict[str, Any]) -> None:
+        """Materialize recipe-gated DROID augmentation on the model device."""
+        if DROID_DEFERRED_AUGMENTATION_KEY not in data_batch:
+            return
+
+        input_key = self.input_video_key
+        media = data_batch.get(input_key)
+        if not isinstance(media, list):
+            raise TypeError(
+                "Deferred DROID augmentation expects packed video data as a per-sample list, "
+                f"got {type(media).__name__}."
+            )
+        if "image_size" not in data_batch:
+            raise ValueError("Deferred DROID augmentation requires image_size metadata.")
+
+        sample_count = len(media)
+        # misc.to() recursively moves the small metadata tensors to CUDA along
+        # with the videos. Consolidate all values into one [B,20] transfer back
+        # to CPU so parsing Python crop sizes and ColorJitter factors causes one
+        # synchronization per packed batch rather than several per sample.
+        metadata_cpu = self._collect_deferred_droid_metadata_cpu(data_batch, sample_count)
+        for sample_index, media_item in enumerate(media):
+            metadata = metadata_cpu[sample_index]
+            if not bool(metadata[0].item()):
+                raise ValueError(
+                    f"Invalid deferred DROID marker for sample {sample_index}: value={metadata[0].item()}."
+                )
+
+            was_nested = isinstance(media_item, (list, tuple))
+            if was_nested:
+                if len(media_item) != 1:
+                    raise ValueError(
+                        "Deferred DROID augmentation requires exactly one video item per sample, "
+                        f"got {len(media_item)} for sample {sample_index}."
+                    )
+                packed_video = media_item[0]
+            else:
+                packed_video = media_item
+            if not isinstance(packed_video, torch.Tensor):
+                raise TypeError(
+                    f"Deferred DROID video for sample {sample_index} must be a tensor, "
+                    f"got {type(packed_video).__name__}."
+                )
+
+            had_batch_dim = packed_video.ndim == 5
+            if had_batch_dim:
+                if packed_video.shape[0] != 1:
+                    raise ValueError(
+                        f"Deferred DROID per-sample video batch dimension must be one, got {tuple(packed_video.shape)}."
+                    )
+                packed_video = packed_video[0]
+            target_device = torch.device(self.tensor_kwargs_fp32["device"])
+            packed_video = packed_video.to(
+                device=target_device,
+                non_blocking=target_device.type != "cpu",
+            )
+
+            augmented_video = apply_deferred_droid_augmentation(
+                packed_video,
+                crop_params=metadata[1:7],
+                color_order=metadata[7:11],
+                color_factors=metadata[11:15],
+                image_size=metadata[16:20],
+                frame_chunk_size=int(metadata[15].item()),
+            )
+            if had_batch_dim:
+                augmented_video = augmented_video.unsqueeze(0)
+            media[sample_index] = [augmented_video] if was_nested else augmented_video
+
+        for key in DROID_DEFERRED_METADATA_KEYS:
+            data_batch.pop(key, None)
+
+    @classmethod
+    def _collect_deferred_droid_metadata_cpu(
+        cls,
+        data_batch: dict[str, Any],
+        sample_count: int,
+    ) -> torch.Tensor:
+        """Collect six metadata fields with a single device synchronization."""
+        fields = (
+            (DROID_DEFERRED_AUGMENTATION_KEY, 1),
+            (DROID_DEFERRED_CROP_KEY, 6),
+            (DROID_DEFERRED_COLOR_ORDER_KEY, 4),
+            (DROID_DEFERRED_COLOR_FACTORS_KEY, 4),
+            (DROID_DEFERRED_FRAME_CHUNK_KEY, 1),
+            ("image_size", 4),
+        )
+        rows: list[torch.Tensor] = []
+        for sample_index in range(sample_count):
+            values: list[torch.Tensor] = []
+            metadata_device: torch.device | None = None
+            for key, expected_values in fields:
+                value = cls._get_deferred_droid_metadata(
+                    data_batch,
+                    key,
+                    sample_index,
+                    sample_count,
+                ).reshape(-1)
+                if value.numel() != expected_values:
+                    raise ValueError(
+                        f"Deferred DROID metadata {key!r} must contain {expected_values} values, "
+                        f"got shape {tuple(value.shape)}."
+                    )
+                if metadata_device is None:
+                    metadata_device = value.device
+                values.append(value.to(device=metadata_device, dtype=torch.float32))
+            rows.append(torch.cat(values))
+
+        if not rows:
+            return torch.empty((0, 20), dtype=torch.float32)
+        return torch.stack(rows).cpu()
+
+    @staticmethod
+    def _get_deferred_droid_metadata(
+        data_batch: dict[str, Any],
+        key: str,
+        sample_index: int,
+        sample_count: int,
+    ) -> torch.Tensor:
+        """Extract one tensor from collated or packed per-sample metadata."""
+        if key not in data_batch:
+            raise ValueError(f"Deferred DROID augmentation is missing metadata key {key!r}.")
+        value = data_batch[key]
+        if isinstance(value, (list, tuple)):
+            if len(value) != sample_count:
+                raise ValueError(
+                    f"Deferred DROID metadata {key!r} has {len(value)} entries for {sample_count} samples."
+                )
+            value = value[sample_index]
+            while isinstance(value, (list, tuple)) and len(value) == 1:
+                value = value[0]
+        elif isinstance(value, torch.Tensor) and sample_count > 1:
+            if value.shape[0] != sample_count:
+                raise ValueError(
+                    f"Deferred DROID metadata {key!r} has shape {tuple(value.shape)} for {sample_count} samples."
+                )
+            value = value[sample_index]
+
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"Deferred DROID metadata {key!r} must resolve to a tensor, got {type(value).__name__}.")
+        return value
 
     def _normalize_video_databatch_inplace(
         self, data_batch: dict[str, torch.Tensor], input_key: str | None = None

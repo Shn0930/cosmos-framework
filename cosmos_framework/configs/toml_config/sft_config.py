@@ -214,18 +214,22 @@ class ActivationCheckpointingConfig(BaseModel):
     mode: str = Field(
         default="full",
         description=(
-            "AC mode: 'selective' (per-op SAC; save matmuls/FMHA, recompute "
-            "the rest — MoT path only), 'full' (checkpoint each whole "
-            "transformer block), or 'none' (no checkpointing — fastest but "
-            "highest memory)."
+            "AC mode: 'selective' (backend-aware per-op SAC; save expensive "
+            "compute/communication outputs, recompute every second matrix "
+            "multiply and cheap ops — MoT path only), 'full' (checkpoint each "
+            "whole transformer block), or 'none' (no checkpointing — fastest "
+            "but highest memory)."
         ),
     )
     save_ops_regex: list[str] = Field(
-        default_factory=lambda: ["fmha"],
+        default_factory=list,
         description=(
-            "Regex patterns for ops to KEEP saved when mode='selective'. "
-            "Ignored in 'full'/'none' mode. Default keeps flash/multi-head-"
-            "attention outputs."
+            "Optional additive regex patterns for custom ops to KEEP saved "
+            "when mode='selective'. Built-in exact matches cover Cosmos "
+            "attention backends, SDPA/FlexAttention, compute-intensive ATen "
+            "ops, and distributed collectives. Patterns match canonical "
+            "namespace-qualified op strings; anchor them to avoid false "
+            "matches. Ignored in 'full'/'none' mode."
         ),
     )
     preserve_rng_state: bool = Field(
@@ -238,9 +242,9 @@ class ActivationCheckpointingConfig(BaseModel):
     determinism_check: str = Field(
         default="default",
         description=(
-            "Forwarded to torch.utils.checkpoint. 'default' disables the "
-            "extra determinism check; 'match' cross-checks recomputed "
-            "activations against the original (debug-only, very slow)."
+            "Forwarded to torch.utils.checkpoint. 'default' compares "
+            "recomputed tensor shape/dtype/device metadata; 'none' disables "
+            "the check."
         ),
     )
 
@@ -357,8 +361,7 @@ class ModelConfig(BaseModel):
     lora_rank: int = Field(
         default=16,
         description=(
-            "LoRA rank `r`. Adapter shape is (rank × hidden_dim) per target "
-            "module. Standard values are 4, 8, 16, 32."
+            "LoRA rank `r`. Adapter shape is (rank × hidden_dim) per target module. Standard values are 4, 8, 16, 32."
         ),
     )
     lora_alpha: int = Field(
@@ -379,9 +382,7 @@ class ModelConfig(BaseModel):
     ema: EMAConfig = Field(default_factory=EMAConfig)
     parallelism: ParallelismConfig = Field(default_factory=ParallelismConfig)
     compile: CompileConfig = Field(default_factory=CompileConfig)
-    activation_checkpointing: ActivationCheckpointingConfig = Field(
-        default_factory=ActivationCheckpointingConfig
-    )
+    activation_checkpointing: ActivationCheckpointingConfig = Field(default_factory=ActivationCheckpointingConfig)
     tokenizer: ModelTokenizerConfig = Field(default_factory=ModelTokenizerConfig)
     backbone: BackboneConfig = Field(default_factory=BackboneConfig)
 
@@ -473,15 +474,12 @@ class SchedulerConfig(BaseModel):
     )
     f_start: list[float] = Field(
         default_factory=lambda: [1.0e-6],
-        description=(
-            "Initial LR multiplier at step 0, before warmup ramps up."
-        ),
+        description=("Initial LR multiplier at step 0, before warmup ramps up."),
     )
     verbosity_interval: int = Field(
         default=0,
         description=(
-            "How often the scheduler logs the current LR (in optimizer "
-            "steps). 0 = silent. VFM only — skipped on VLM."
+            "How often the scheduler logs the current LR (in optimizer steps). 0 = silent. VFM only — skipped on VLM."
         ),
     )
     warm_up_steps: list[int] = Field(
@@ -533,8 +531,7 @@ class GradClipCallback(BaseModel):
     clip_norm: float = Field(
         default=1.0,
         description=(
-            "Maximum global L2 norm of the gradient. Steps with a larger "
-            "norm are rescaled so ||grad|| ≤ clip_norm."
+            "Maximum global L2 norm of the gradient. Steps with a larger norm are rescaled so ||grad|| ≤ clip_norm."
         ),
     )
     force_finite: bool = Field(
@@ -567,8 +564,7 @@ class TrainerConfig(BaseModel):
     distributed_parallelism: str = Field(
         default="fsdp",
         description=(
-            "Distributed strategy. 'fsdp' (the only supported value today) "
-            "routes through cosmos's FSDP wrapper."
+            "Distributed strategy. 'fsdp' (the only supported value today) routes through cosmos's FSDP wrapper."
         ),
     )
     grad_accum_iter: int = Field(
@@ -658,10 +654,7 @@ class DataloaderTrainConfig(BaseModel):
     )
     seed: int = Field(
         default=42,
-        description=(
-            "Dataloader RNG seed. Skipped on VLM (CosmosDataLoader has "
-            "no seed ctor kwarg there)."
-        ),
+        description=("Dataloader RNG seed. Skipped on VLM (CosmosDataLoader has no seed ctor kwarg there)."),
     )
 
 
@@ -746,8 +739,7 @@ def load_experiment_from_toml(
         base_config_path = TASK_TO_BASE_CONFIG[task]
     except KeyError as e:
         raise ValueError(
-            f"{toml_path}: [job].task={task!r} is not supported. "
-            f"Valid values: {sorted(TASK_TO_BASE_CONFIG)}"
+            f"{toml_path}: [job].task={task!r} is not supported. Valid values: {sorted(TASK_TO_BASE_CONFIG)}"
         ) from e
 
     overrides = build_hydra_overrides(raw)
@@ -759,10 +751,7 @@ def load_experiment_from_toml(
             if not o or o == "--":
                 continue
             if "=" not in o:
-                raise ValueError(
-                    f"extra override {o!r} must be Hydra dotted-path syntax "
-                    f"(e.g. 'optimizer.lr=1e-5')."
-                )
+                raise ValueError(f"extra override {o!r} must be Hydra dotted-path syntax (e.g. 'optimizer.lr=1e-5').")
             overrides.append(o)
 
     # Import lazily so this module stays cheap to import in non-training contexts.

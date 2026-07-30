@@ -26,10 +26,15 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, ClassVar
 
+import datasets as hf_datasets
 import huggingface_hub.constants as _hf_const
 import numpy as np
+import pyarrow.dataset as pa_ds
+import pyarrow.parquet as pq
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.utils import get_hf_features_from_features, hf_transform_to_torch
+from lerobot.utils.utils import SuppressProgressBars
 from torch.utils.data import Dataset
 
 _hf_offline_applied = False
@@ -111,6 +116,7 @@ def rss_tracker(*args, **kwargs):
 # ---------------------------------------------------------------------------
 _LRU_VIDEO_CACHE_MAX_SIZE: int = 64
 _LRU_DATASET_MAX_LOADED: int = 32
+_LEROBOT_REQUIRED_FRAME_COLUMNS: tuple[str, ...] = ("timestamp", "episode_index", "index", "task_index")
 ActionNormalization = ActionNormalizationMethod
 _ACTION_NORMALIZATION_CHOICES: tuple[str, ...] = ("quantile", "quantile_rot", "meanstd", "minmax")
 
@@ -225,6 +231,112 @@ def _parallel_map(
     log.info(f"{label}: {len(items)} tasks (workers={max_workers})")
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         return list(ex.map(fn, items))
+
+
+def build_projected_data_columns(
+    delta_timestamps: dict[str, list[float]],
+    *,
+    video_keys: Sequence[str],
+) -> tuple[str, ...]:
+    """Resolve the physical parquet columns needed by a LeRobot sample.
+
+    Video keys are metadata-only in LeRobot v3 and live in MP4 files, so they
+    must not be requested from the data parquet. The four frame columns are
+    required by :class:`LeRobotDataset` for index resolution, timestamp
+    queries, and task lookup.
+    """
+    video_key_set = set(video_keys)
+    columns = list(_LEROBOT_REQUIRED_FRAME_COLUMNS)
+    for key in delta_timestamps:
+        if key not in video_key_set and key not in columns:
+            columns.append(key)
+    return tuple(columns)
+
+
+def _load_projected_nested_dataset(
+    pq_dir: Path,
+    *,
+    columns: Sequence[str],
+    features: hf_datasets.Features | None = None,
+    episodes: Sequence[int] | None = None,
+    cache_dir: Path | None = None,
+) -> hf_datasets.Dataset:
+    """Load nested LeRobot parquet files with physical column projection.
+
+    This mirrors LeRobot's ``load_nested_dataset`` while passing ``columns``
+    through to Hugging Face Datasets / PyArrow. The explicit schema check turns
+    otherwise opaque Arrow cast errors into an actionable missing-column error.
+    """
+    paths = sorted(pq_dir.glob("*/*.parquet"))
+    if not paths:
+        raise FileNotFoundError(f"Provided directory does not contain any parquet file: {pq_dir}")
+
+    projected_columns = tuple(dict.fromkeys(columns))
+    if not projected_columns:
+        raise ValueError("Projected LeRobot parquet columns must not be empty.")
+
+    if features is not None:
+        feature_columns = tuple(features)
+        if feature_columns != projected_columns:
+            raise ValueError(
+                "Projected LeRobot features must match requested parquet columns in the same order: "
+                f"columns={list(projected_columns)}, features={list(feature_columns)}"
+            )
+
+    if episodes is not None and "episode_index" not in projected_columns:
+        raise ValueError("Projected LeRobot episode filtering requires the 'episode_index' parquet column.")
+
+    for path in paths:
+        available = set(pq.read_schema(path).names)
+        missing = [column for column in projected_columns if column not in available]
+        if missing:
+            raise ValueError(
+                f"Projected LeRobot parquet columns missing from {path}: {missing}. "
+                f"Available columns: {sorted(available)}"
+            )
+
+    with SuppressProgressBars():
+        if episodes is None:
+            return hf_datasets.Dataset.from_parquet(
+                [str(path) for path in paths],
+                features=features,
+                columns=list(projected_columns),
+                cache_dir=str(cache_dir) if cache_dir is not None else None,
+            )
+
+        arrow_dataset = pa_ds.dataset(paths, format="parquet")
+        filter_expr = pa_ds.field("episode_index").isin(list(episodes))
+        table = arrow_dataset.to_table(columns=list(projected_columns), filter=filter_expr)
+        if features is not None:
+            table = table.cast(features.arrow_schema)
+        return hf_datasets.Dataset(table)
+
+
+class ProjectedLeRobotDataset(LeRobotDataset):
+    """LeRobot dataset whose frame parquet is restricted to required columns."""
+
+    def __init__(self, *args: Any, data_columns: Sequence[str], **kwargs: Any) -> None:
+        self._data_columns = tuple(dict.fromkeys(data_columns))
+        super().__init__(*args, **kwargs)
+
+    def load_hf_dataset(self) -> hf_datasets.Dataset:
+        """Load only ``data_columns`` while preserving LeRobot item semantics."""
+        all_features = get_hf_features_from_features(self.features)
+        missing_from_metadata = [column for column in self._data_columns if column not in all_features]
+        if missing_from_metadata:
+            raise ValueError(
+                f"Projected LeRobot columns are absent from metadata features at {self.root}: "
+                f"{missing_from_metadata}. Available non-video features: {list(all_features)}"
+            )
+        projected_features = hf_datasets.Features({column: all_features[column] for column in self._data_columns})
+        hf_dataset = _load_projected_nested_dataset(
+            self.root / "data",
+            columns=self._data_columns,
+            features=projected_features,
+            episodes=self.episodes,
+        )
+        hf_dataset.set_transform(hf_transform_to_torch)
+        return hf_dataset
 
 
 def split_episode_ids(total_episodes: int, seed: int, val_ratio: float, split: str) -> list[int]:
@@ -382,6 +494,9 @@ class BaseActionLeRobotDataset(Dataset):
             self._datasets: list[LeRobotDataset | None] = []
             self._dataset_build_args: list[dict[str, Any] | None] = []
             self._loaded_lru: OrderedDict[int, None] = OrderedDict()
+            # Subclasses may opt into physical parquet column projection after
+            # defining their modality-specific ``_delta_timestamps``.
+            self._parquet_data_columns: tuple[str, ...] | None = None
 
             # -- Flat index structures (populated by _append_index_records) --
             # Together these two lists form a searchable map from a flat
@@ -660,17 +775,24 @@ class BaseActionLeRobotDataset(Dataset):
                 delta_ts = {k: v for k, v in delta_ts.items() if not k.startswith("observation.image")}
 
             log.info(f"Loading shard root={build_args['root']}")
-            ds = LeRobotDataset(
-                repo_id=build_args["repo_id"],
-                root=build_args["root"],
-                delta_timestamps=delta_ts,
-                tolerance_s=build_args["tolerance_s"],
-                force_cache_sync=build_args["force_cache_sync"],
-                download_videos=build_args["download_videos"],
-                video_backend=build_args["video_backend"],
-                revision=build_args["revision"],
-                episodes=None,
-            )
+            dataset_kwargs = {
+                "repo_id": build_args["repo_id"],
+                "root": build_args["root"],
+                "delta_timestamps": delta_ts,
+                "tolerance_s": build_args["tolerance_s"],
+                "force_cache_sync": build_args["force_cache_sync"],
+                "download_videos": build_args["download_videos"],
+                "video_backend": build_args["video_backend"],
+                "revision": build_args["revision"],
+                "episodes": None,
+            }
+            if self._parquet_data_columns is None:
+                ds = LeRobotDataset(**dataset_kwargs)
+            else:
+                ds = ProjectedLeRobotDataset(
+                    **dataset_kwargs,
+                    data_columns=self._parquet_data_columns,
+                )
             if self._skip_video_loading:
                 ds.meta.info["features"] = {
                     k: v for k, v in ds.meta.info["features"].items() if v.get("dtype") != "video"

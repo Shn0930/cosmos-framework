@@ -260,7 +260,7 @@ Knobs are in the recipe TOML under `[model]`, `[model.parallelism]`, and `[datal
 
 2. **Enable activation checkpointing** in `[model.activation_checkpointing]`:
    - `mode = "full"` — checkpoint every transformer block (largest memory savings, trades extra recompute for memory).
-   - `mode = "selective"` — per-op SAC, MoT only (smaller savings, smaller overhead). Falls back to no checkpointing on the VLM path.
+   - `mode = "selective"` — backend-aware per-op SAC, MoT only (smaller savings, smaller overhead). The built-in exact allowlist covers FlashAttention, Cosmos cuDNN, NATTEN, SDPA/FlexAttention, compute-intensive ATen ops, and distributed collectives; `save_ops_regex` is only an additive custom-backend escape hatch. Falls back to no checkpointing on the VLM path. This is the recommended first comparison for Cosmos3-Nano-Policy-DROID; benchmark steady-state iteration time and peak GPU memory against `"full"` for the target sequence length and batch size.
 
 3. **Raise `[model.parallelism].data_parallel_shard_degree`** to shard weights/optimizer state across more ranks via FSDP. Runtime invariant (from `cosmos_framework/utils/generator/parallelism.py:50-52`): `data_parallel_replicate_degree × data_parallel_shard_degree == WORLD_SIZE` always holds — `context_parallel_shard_degree` and `cfg_parallel_shard_degree` are *overlay* axes that share dp rank slots, not separate mesh dims. Use `-1` to let `data_parallel_shard_degree` auto-fill from `torchrun` world size.
 

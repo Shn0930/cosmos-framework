@@ -52,10 +52,14 @@ class ActivationCheckpointingConfig:
         validator=attrs.validators.in_({"selective", "full", "none"}),
     )
 
-    # Regex patterns for ops to save when using selective AC. Ignored if
-    # mode is "full" or "none". MoT only — unused on the VLM path.
+    # Optional, additive regex patterns for custom ops to save when using
+    # selective AC. Built-in exact matches already cover compute-intensive
+    # ATen ops, Cosmos attention backends, SDPA/FlexAttention, and distributed
+    # collectives. Patterns match the canonical namespace-qualified op string;
+    # anchor custom patterns to avoid retaining unrelated activations. Ignored
+    # if mode is "full" or "none". MoT only — unused on the VLM path.
     save_ops_regex: list[str] = attrs.field(
-        factory=lambda: ["fmha"],
+        factory=list,
     )
 
     # Stash and restore RNG state across recompute boundaries. Required for
@@ -64,6 +68,7 @@ class ActivationCheckpointingConfig:
     preserve_rng_state: bool = True
 
     # Determinism check forwarded to ``ptd_checkpoint_wrapper`` /
-    # ``torch.utils.checkpoint.checkpoint``. MoT only — unused on the
-    # VLM path.
+    # ``torch.utils.checkpoint.checkpoint``. "default" compares recomputed
+    # tensor shape/dtype/device metadata; "none" disables the check. MoT only
+    # — unused on the VLM path.
     determinism_check: str = "default"

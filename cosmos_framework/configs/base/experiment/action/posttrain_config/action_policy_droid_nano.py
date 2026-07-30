@@ -10,7 +10,7 @@ action heads from the public ``nvidia/Cosmos3-Nano`` base.
 
 Usage (1 node, 8 GPU)::
 
-    DROID_ROOT=/path/to/droid_lerobot_640x360/success \\
+    DROID_ROOT=/path/to/droid_plus_lerobot_640x360_20260412 \\
     BASE_CHECKPOINT_PATH=<Cosmos3-Nano DCP dir> \\
     WAN_VAE_PATH=<Wan2.2_VAE.pth> \\
     torchrun --nproc_per_node=8 -m cosmos_framework.scripts.train \\
@@ -165,16 +165,23 @@ action_policy_droid_nano = LazyDict(
         dataloader_train=L(PackingDataLoader)(
             audio_sample_rate=48000,
             dataset_name="action_droid",
-            max_samples_per_batch=128,  # per rank -> 8192 global batch at 64 ranks (16 nodes, shard 8 x replicate 8)
+            # Keep the Python-config default aligned with the canonical TOML:
+            # 32 samples/rank, exactly one bounded inner-DataLoader queue.
+            max_samples_per_batch=32,
             max_sequence_length=None,  # None disables token packing (TOML can't express null)
             patch_spatial=2,
             sound_latent_fps=0,
             tokenizer_spatial_compression_factor=16,
             tokenizer_temporal_compression_factor=4,
             dataloader=L(RankPartitionedDataLoader)(
-                batch_size=16,
+                # Canonical TOML packs 32 samples/rank. DataLoader prefetch
+                # capacity is batch_size * num_workers * prefetch_factor =
+                # 2 * 8 * 2 = 32 samples, avoiding both a supply gap and the
+                # former 512-sample queue. Tune from host measurements
+                # when overriding the packed sample count.
+                batch_size=2,
                 in_order=False,
-                num_workers=16,  # host-CPU-bound; lower via CLI on smaller hosts
+                num_workers=8,
                 persistent_workers=True,
                 pin_memory=True,
                 prefetch_factor=2,
@@ -201,9 +208,15 @@ action_policy_droid_nano = LazyDict(
                             use_state=True,
                             iterable_shuffle=True,  # rank x worker episode-shuffle stream
                             episode_shuffle_seed=42,
-                            # SR boost: random crop+rescale + ColorJitter, applied CPU-side in the
-                            # DROIDLeRobotDataset image augmentor (matches i4's pipeline stage).
+                            # SR boost: sample crop/ColorJitter RNG in workers,
+                            # then apply the same crop/resize/ColorJitter order
+                            # on GPU before normalization. Function-level default
+                            # remains CPU, so only this recipe opts into it.
                             use_image_augmentation=True,
+                            image_augmentation_backend="gpu",
+                            # Bounds ColorJitter's CUDA temporary footprint while
+                            # reusing one order/factor set across all views/frames.
+                            image_augmentation_gpu_frame_chunk=8,
                             # keep_ranges_1_0_1.json window filter (drops idle/non-task frames). Off by default;
                             # set use_filter_dict=True + filter_dict_path to enable.
                             use_filter_dict=False,

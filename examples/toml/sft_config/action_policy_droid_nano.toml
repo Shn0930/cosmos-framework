@@ -10,7 +10,7 @@
 # pins the run-level scalars that define the reference reproduction.
 #
 # Env required:
-#   DROID_ROOT=/path/to/droid_lerobot_640x360/success
+#   DROID_ROOT=/path/to/droid_plus_lerobot_640x360_20260412
 #   BASE_CHECKPOINT_PATH=<Cosmos3-Nano DCP dir>
 #   WAN_VAE_PATH=<Wan2.2_VAE.pth>
 #   IMAGINAIRE_OUTPUT_ROOT=/path/to/output_root   # persist checkpoints
@@ -32,8 +32,10 @@ data_parallel_shard_degree     = 8     # 8-GPU model shard
 data_parallel_replicate_degree = 32    # HSDP 32x8 = 256 ranks (GB200 reference: 64 nodes x 4)
 
 [model.activation_checkpointing]
-mode           = "full"
-save_ops_regex = ["fmha"]
+mode           = "selective"
+# Built-in SAC policy covers Flash3/NATTEN/cuDNN attention, compute-heavy
+# matmuls, and collectives. Keep this list for genuinely custom operators only.
+save_ops_regex = []
 
 [model.tokenizer]
 vae_path = "${oc.env:WAN_VAE_PATH}"

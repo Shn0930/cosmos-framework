@@ -22,6 +22,7 @@ from cosmos_framework.data.generator.action.datasets.cosmos3_action_lerobot impo
     Rot,
     build_action_spec,
     build_episode_spans,
+    build_projected_data_columns,
     split_episode_ids,
 )
 from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset_config import (
@@ -36,6 +37,9 @@ from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset_confi
     LEROBOT_ROOTS,
     STATE_FEATURES,
 )
+from cosmos_framework.data.generator.action.droid_gpu_augmentation import (
+    prepare_deferred_droid_augmentation,
+)
 from cosmos_framework.data.generator.action.pose_utils import (
     PoseConvention,
     build_abs_pose_from_components,
@@ -46,6 +50,8 @@ from cosmos_framework.data.generator.action.viewpoint_utils import Viewpoint
 from cosmos_framework.utils import log
 
 _FILTER_DICT_PATH = "/scratch/fsw/portfolios/cosmos/projects/cosmos_base_training/users/haolia/workspace/droid_oss_inputs/keep_ranges_1_0_1.json"
+_ACTION_SPACES = ("midtrain", "ee_pose_delta", "joint_pos")
+_IMAGE_AUGMENTATION_BACKENDS = ("cpu", "gpu")
 
 # 90-degree clockwise rotation about the Z axis (in local frame), converting
 # DROID Franka panda_link8 orientation to the OpenCV camera convention.
@@ -57,6 +63,54 @@ _DROID_TO_OPENCV: np.ndarray = np.array(
     ],
     dtype=np.float32,
 )
+
+
+def _build_droid_delta_timestamps(
+    *,
+    action_space: str,
+    state_feature: str,
+    action_feature: str,
+    image_features: dict[str, str],
+    viewpoint: Viewpoint,
+    use_state: bool,
+    max_num_history_actions: int,
+    dt: float,
+    chunk_length: int,
+) -> dict[str, list[float]]:
+    """Build only the temporal feature queries consumed by one action space."""
+    if action_space not in _ACTION_SPACES:
+        raise ValueError(f"Unsupported DROID action_space={action_space!r}; expected one of {_ACTION_SPACES}.")
+
+    observation_ts = [i * dt for i in range(0, chunk_length + 1)]
+    action_ts = [i * dt for i in range(0, chunk_length)]
+    observation_ts_ext = [i * dt for i in range(-max_num_history_actions, chunk_length + 1)]
+    action_ts_ext = [i * dt for i in range(-max_num_history_actions, chunk_length)]
+
+    delta_timestamps: dict[str, list[float]] = {}
+    if action_space == "joint_pos":
+        # Joint policy consumes commanded joints + gripper actions. Cartesian
+        # state is intentionally absent: the joint branch never reads it.
+        delta_timestamps[action_feature] = action_ts
+        delta_timestamps[_JOINT_ACTION_FEATURE] = action_ts
+        if use_state or max_num_history_actions > 0:
+            delta_timestamps[_JOINT_STATE_FEATURE] = observation_ts_ext
+            delta_timestamps[_GRIPPER_STATE_FEATURE] = observation_ts_ext
+    else:
+        # Cartesian policies consume end-effector state + gripper actions.
+        # Only midtrain supports history; ee_pose_delta always uses the base
+        # observation/action window.
+        use_history = action_space == "midtrain" and max_num_history_actions > 0
+        delta_timestamps[state_feature] = observation_ts_ext if use_history else observation_ts
+        delta_timestamps[action_feature] = action_ts_ext if use_history else action_ts
+        if use_state:
+            delta_timestamps[_GRIPPER_STATE_FEATURE] = observation_ts
+
+    if viewpoint in ("wrist_view", "concat_view"):
+        delta_timestamps[image_features["wrist"]] = observation_ts
+    if viewpoint in ("third_person_view", "concat_view"):
+        delta_timestamps[image_features["left"]] = observation_ts
+        delta_timestamps[image_features["right"]] = observation_ts
+    return delta_timestamps
 
 
 class DROIDLeRobotDataset(BaseActionLeRobotDataset):
@@ -86,6 +140,8 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         enable_fast_init: bool = False,
         max_num_history_actions: int = 0,
         use_image_augmentation: bool = False,
+        image_augmentation_backend: str = "cpu",
+        image_augmentation_gpu_frame_chunk: int = 8,
     ) -> None:
         """ """
         super().__init__(
@@ -111,10 +167,30 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         self._filter_dict_path = filter_dict_path or _FILTER_DICT_PATH
         self._max_num_history_actions = max_num_history_actions
         self._use_image_augmentation = use_image_augmentation
+        self._image_augmentation_backend = image_augmentation_backend
+        self._image_augmentation_gpu_frame_chunk = image_augmentation_gpu_frame_chunk
         if max_num_history_actions > 0 and action_space not in ("midtrain", "joint_pos"):
             raise ValueError(
                 f"max_num_history_actions is only supported with action_space='midtrain' or 'joint_pos', got {action_space!r}"
             )
+        if image_augmentation_backend not in _IMAGE_AUGMENTATION_BACKENDS:
+            raise ValueError(
+                f"image_augmentation_backend must be one of {_IMAGE_AUGMENTATION_BACKENDS}, "
+                f"got {image_augmentation_backend!r}."
+            )
+        if image_augmentation_backend == "gpu":
+            if image_augmentation_gpu_frame_chunk <= 0:
+                raise ValueError(
+                    "image_augmentation_gpu_frame_chunk must be positive when "
+                    f"image_augmentation_backend='gpu', got {image_augmentation_gpu_frame_chunk}."
+                )
+            if not use_image_augmentation:
+                raise ValueError("image_augmentation_backend='gpu' requires use_image_augmentation=True.")
+            if viewpoint != "concat_view" or video_mode is not None:
+                raise ValueError(
+                    "image_augmentation_backend='gpu' currently supports only "
+                    "viewpoint='concat_view' with video_mode=None."
+                )
 
         self._is_val_temp_seg = split == "val_temp_seg"
         self._to_opencv = _DROID_TO_OPENCV
@@ -136,30 +212,25 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
 
         self._all_shard_roots = [os.path.join(root, x) for x in lerobot_roots] if lerobot_roots else [root]
 
-        observation_ts = [i * self._dt for i in range(0, self._chunk_length + 1)]
-        action_ts = [i * self._dt for i in range(0, self._chunk_length)]
-        if self._max_num_history_actions > 0 and self._action_space in ("midtrain", "joint_pos"):
-            observation_ts_ext = [i * self._dt for i in range(-self._max_num_history_actions, self._chunk_length + 1)]
-            action_ts_ext = [i * self._dt for i in range(-self._max_num_history_actions, self._chunk_length)]
-        else:
-            observation_ts_ext = observation_ts
-            action_ts_ext = action_ts
-        self._delta_timestamps: dict[str, list[float]] = {
-            self._state_features: observation_ts_ext,
-            self._action_features: action_ts_ext,
-        }
-        if self._viewpoint in ("wrist_view", "concat_view"):
-            self._delta_timestamps[self._image_features["wrist"]] = observation_ts
-        if self._viewpoint in ("third_person_view", "concat_view"):
-            self._delta_timestamps[self._image_features["left"]] = observation_ts
-            self._delta_timestamps[self._image_features["right"]] = observation_ts
-        if self._action_space == "joint_pos":
-            self._delta_timestamps[_JOINT_ACTION_FEATURE] = action_ts
-            if self._use_state or self._max_num_history_actions > 0:
-                self._delta_timestamps[_JOINT_STATE_FEATURE] = observation_ts_ext
-                self._delta_timestamps[_GRIPPER_STATE_FEATURE] = observation_ts_ext
-        if self._use_state and self._action_space != "joint_pos":
-            self._delta_timestamps[_GRIPPER_STATE_FEATURE] = observation_ts
+        self._delta_timestamps = _build_droid_delta_timestamps(
+            action_space=self._action_space,
+            state_feature=self._state_features,
+            action_feature=self._action_features,
+            image_features=self._image_features,
+            viewpoint=self._viewpoint,
+            use_state=self._use_state,
+            max_num_history_actions=self._max_num_history_actions,
+            dt=self._dt,
+            chunk_length=self._chunk_length,
+        )
+        self._parquet_data_columns = build_projected_data_columns(
+            self._delta_timestamps,
+            video_keys=tuple(self._image_features.values()),
+        )
+        if self._is_val_temp_seg and self._state_features not in self._parquet_data_columns:
+            # Temporal-segment scoring reads Cartesian displacement even for a
+            # joint-space policy; keep that eval-only column out of train.
+            self._parquet_data_columns = (*self._parquet_data_columns, self._state_features)
 
         if self._use_filter_dict:
             with open(self._filter_dict_path) as f:
@@ -233,15 +304,24 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         - The gripper is closed and the end-effector position is moving.
         Among qualifying segments the one with the highest score is kept.
         """
-        ds = self._get_dataset(0)
         chunk_size = self._chunk_length + 1
         gripper_change_threshold = 0.5
         ee_movement_threshold = 0.01
 
         new_records: list[tuple[int, int, int, int]] = []
         num_episodes = len(self._episode_records)
+        current_ds_idx: int | None = None
+        ds = None
 
         for ds_idx, sample_start, valid_len, episode_id in self._episode_records:
+            # Records are appended shard-by-shard. Reuse the current lazy
+            # LeRobot dataset for contiguous records while still switching to
+            # the record's actual shard when ``ds_idx`` changes.
+            if ds_idx != current_ds_idx:
+                ds = self._get_dataset(ds_idx)
+                current_ds_idx = ds_idx
+            assert ds is not None
+
             end = sample_start + valid_len + self._chunk_length
             num_candidates = valid_len
             if num_candidates <= 0:
@@ -337,6 +417,8 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """ """
         mode, _, _, sample = self._fetch_sample(idx)
+        deferred_video: torch.Tensor | None = None
+        deferred_metadata: dict[str, torch.Tensor] = {}
 
         if self._has_multi_language_annotations:
             tasks = sample["task"].split(" | ")
@@ -348,7 +430,16 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
             video = None
         elif self._video_mode is None:
             if self._viewpoint == "concat_view":
-                video = self._compose_multi_view(sample)
+                if self._image_augmentation_backend == "gpu":
+                    deferred_video, deferred_metadata = prepare_deferred_droid_augmentation(
+                        sample[self._image_features["wrist"]],
+                        sample[self._image_features["left"]],
+                        sample[self._image_features["right"]],
+                        frame_chunk_size=self._image_augmentation_gpu_frame_chunk,
+                    )
+                    video = None
+                else:
+                    video = self._compose_multi_view(sample)
             else:
                 video = sample[self._image_features["wrist"]]  # [T,C,H,W]
         else:
@@ -378,6 +469,7 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
                 video = torch.cat([wrist, torch.cat([left, right], dim=-1)], dim=-2)
 
         extras: dict[str, Any] = {}
+        extras.update(deferred_metadata)
 
         if self._action_space == "midtrain":
             pose_convention = cast(PoseConvention, self._pose_convention)
@@ -485,13 +577,19 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
                 "The bottom row contains two horizontally concatenated third-person perspective views of the scene from opposite sides, with the robot visible."
             )
 
-        return self._build_result(
+        result = self._build_result(
             mode=mode,
             video=video,
             action=action,
             ai_caption=ai_caption,
             **extras,
         )
+        if deferred_video is not None:
+            # _build_result owns all common metadata and idle-frame handling,
+            # while the deferred transport tensor is already in final CTHW
+            # uint8 storage format and must bypass _convert_video.
+            result["video"] = deferred_video
+        return result
 
     @property
     def action_dim(self) -> int:

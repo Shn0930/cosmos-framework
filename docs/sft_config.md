@@ -131,12 +131,14 @@ The product `data_parallel_shard_degree × data_parallel_replicate_degree × con
 
 Recompute activations during backward to trade FLOPs for memory. Lands at `model.config.activation_checkpointing.*` on both VFM and VLM.
 
-| field                | default     | description                                                                                                                                                                                      |
-| -------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `mode`               | `"full"`    | `"selective"` (per-op SAC — keep matmuls/FMHA, recompute the rest; MoT path only), `"full"` (checkpoint each whole transformer block), or `"none"` (no checkpointing — fastest, highest memory). |
-| `save_ops_regex`     | `["fmha"]`  | Regex patterns for ops to KEEP saved under `mode="selective"`. Ignored in `"full"`/`"none"`. Default keeps flash/multi-head-attention outputs.                                                   |
-| `preserve_rng_state` | `true`      | Stash + restore CUDA RNG across recompute boundaries. Required for deterministic equivalence with the non-checkpointed path; small slowdown.                                                     |
-| `determinism_check`  | `"default"` | Forwarded to `torch.utils.checkpoint`. `"default"` disables the extra determinism check; `"match"` cross-checks recomputed activations against the original (debug-only, very slow).             |
+| field                | default     | description                                                                                                                                                                                                                                                                                                        |
+| -------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `mode`               | `"full"`    | `"selective"` (backend-aware per-op SAC — save expensive compute/communication outputs, recompute every second matrix multiply and cheap ops; MoT path only), `"full"` (checkpoint each whole transformer block), or `"none"` (no checkpointing — fastest, highest memory).                                           |
+| `save_ops_regex`     | `[]`        | Optional additive patterns for custom ops to KEEP under `mode="selective"`. Built-in exact matches cover FlashAttention, Cosmos cuDNN, NATTEN, SDPA/FlexAttention, compute-intensive ATen ops, and distributed collectives. Match canonical namespace-qualified op strings and anchor custom patterns to avoid false hits. |
+| `preserve_rng_state` | `true`      | Stash + restore CUDA RNG across recompute boundaries. Required for deterministic equivalence with the non-checkpointed path; small slowdown. Under `torch.compile`, PyTorch always preserves RNG state.                                                                                                              |
+| `determinism_check`  | `"default"` | Forwarded to `torch.utils.checkpoint`. `"default"` compares recomputed tensor shape/dtype/device metadata; `"none"` disables the check.                                                                                                                                                                             |
+
+For Cosmos3-Nano-Policy-DROID, start benchmarking with `mode = "selective"`: its attention backends are covered by the built-in policy, so `save_ops_regex` can normally stay empty. Compare steady-state iteration time and peak allocated GPU memory against `"full"` before adopting the setting for a new sequence-length/batch-size regime.
 
 ### `[model.tokenizer]` (VFM only)
 

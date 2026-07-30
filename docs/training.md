@@ -440,8 +440,10 @@ The commonly tuned knobs:
     1. `precision` — Compute dtype for forward/backward: `"bfloat16"` / `"float16"` / `"float32"`. Master weights stay fp32 separately.
 1. `[model.activation_checkpointing]`
     1. `mode` — `"none"` / `"selective"` (per-op SAC, MoT-only) / `"full"` (per-block checkpointing).
-    1. `save_ops_regex` — Regex patterns for ops to keep saved under `mode="selective"`.
-    1. `preserve_rng_state`, `determinism_check` — Recompute determinism plumbing.
+    1. `save_ops_regex` — Optional additive regex patterns for custom ops under `mode="selective"`; built-in exact matches cover Cosmos attention backends, SDPA/FlexAttention, compute-intensive ATen ops, and distributed collectives.
+    1. `preserve_rng_state`, `determinism_check` — Recompute determinism plumbing (`determinism_check="default"` compares shape/dtype/device metadata; `"none"` disables it).
+
+    For Cosmos3-Nano-Policy-DROID, `mode = "selective"` is the recommended first throughput/memory comparison against the conservative `"full"` default. Selective AC follows the TorchTitan balance: it saves expensive operator outputs, recomputes cheap operators, and recomputes every second `aten.mm`/`aten.linear`. Leave `save_ops_regex = []` unless a custom backend emits an operator outside the built-in set; when extending it, match the canonical namespace-qualified operator name with an anchored pattern.
 1. `[model.tokenizer]`
     1. `vae_path` — Wan2.2 VAE `.pth` path. Recipe TOMLs use `"${oc.env:WAN_VAE_PATH}"`. VFM only.
 1. `[optimizer]`

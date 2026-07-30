@@ -3,19 +3,18 @@
 
 """FSDP / activation-checkpointing / torch.compile pass for the unified MoT.
 
-The activation-checkpointing implementation here mirrors the torchtitan SAC
-design (``torchtitan/distributed/activation_checkpoint.py``):
-
-  * Per-op selective AC saves a curated set of compute and communication ops
-    (SDPA variants, FlexAttention, ``aten.linear``, NCCL collectives,
-    DeepEP/HybridEP) and recomputes everything else.
+The selective activation-checkpointing policy follows TorchTitan's
+backend-aware SAC design: save expensive compute/communication op outputs,
+recompute cheap pointwise ops, and recompute every second matrix multiply to
+balance memory with extra FLOPs.
 """
 
 import re
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
+from torch._functorch.partitioners import get_default_op_list
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
@@ -25,19 +24,144 @@ from torch.utils.checkpoint import (
     create_selective_checkpoint_contexts,
 )
 
-from cosmos_framework.utils import log
 from cosmos_framework.configs.base.defaults.activation_checkpointing import ActivationCheckpointingConfig
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
-from cosmos_framework.model.generator.mot.attention import SplitInfo, dispatch_attention
-from cosmos_framework.model.generator.mot.context_parallel_utils import context_parallel_attention
-from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryValue
 from cosmos_framework.data.generator.sequence_packing.runtime import (
     SequencePack,
     from_und_gen_splits,
     get_gen_seq,
     get_und_seq,
 )
+from cosmos_framework.model.generator.mot.attention import SplitInfo, dispatch_attention
+from cosmos_framework.model.generator.mot.context_parallel_utils import context_parallel_attention
+from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryValue
+from cosmos_framework.utils import log
 from cosmos_framework.utils.generator.parallelism import ParallelDims
+
+_SAC_OPTIONAL_SAVE_OP_PATHS = (
+    # SDPA variants not present in Functorch's compute-intensive op list.
+    "aten._scaled_dot_product_cudnn_attention.default",
+    "aten._scaled_dot_product_attention_math.default",
+    "aten._scaled_dot_product_fused_attention_overrideable.default",
+    # Linear can remain a leaf op on some backends instead of decomposing to mm.
+    "aten.linear.default",
+    # Preserve quantization scaling and deterministic MoE routing decisions.
+    "aten.max.default",
+    "aten.topk.default",
+    # External FlashAttention implementations used by Cosmos.
+    "flash_attn._flash_attn_forward.default",
+    "flash_attn._flash_attn_varlen_forward.default",
+    "flash_attn_3._flash_attn_forward.default",
+    "flash_attn_3._flash_attn_varlen_forward.default",
+    # NATTEN dense attention implementations.
+    "natten.fmha_forward.default",
+    "natten.hopper_fmha_forward.default",
+    "natten.blackwell_fmha_forward.default",
+    # Cosmos TransformerEngine/cuDNN fused attention.
+    "cosmos3.cudnn_fused_attn.default",
+    # Optional torch-attn backend.
+    "torch_attn._varlen_attn.default",
+    # Distributed collectives should not run again during recomputation.
+    "_c10d_functional.reduce_scatter_tensor.default",
+    "_c10d_functional.all_to_all_single.default",
+    "deepep.dispatch.default",
+    "deepep.combine.default",
+    "hybridep.dispatch.default",
+    "hybridep.combine.default",
+)
+_SAC_EXACT_SAVE_OP_NAMES = frozenset(_SAC_OPTIONAL_SAVE_OP_PATHS)
+_SAC_MM_OPS = (torch.ops.aten.mm.default, torch.ops.aten.linear.default)
+
+
+def _resolve_torch_op(path: str) -> object | None:
+    """Resolve a dotted ``torch.ops`` path, tolerating optional backends."""
+    op: object = torch.ops
+    try:
+        for path_component in path.split("."):
+            op = getattr(op, path_component)
+    except AttributeError:
+        return None
+    return op
+
+
+def _get_default_sac_save_ops() -> set[object]:
+    """Return the exact operators whose outputs default SAC keeps.
+
+    Functorch owns the base list of compute-intensive operators. Cosmos adds
+    the attention and communication backends that can remain opaque leaf ops
+    instead of decomposing into the base ATen operators.
+    """
+    op_types = get_default_op_list()
+    save_ops = {
+        op.default  # pyrefly: ignore [missing-attribute]
+        for op in op_types.compute_intensive_ops
+    }
+
+    # FlexAttention is a higher-order operator rather than a torch.ops packet.
+    save_ops.add(torch._higher_order_ops.flex_attention)
+    inductor_compiled_code = getattr(torch._higher_order_ops, "inductor_compiled_code", None)
+    if inductor_compiled_code is not None:
+        save_ops.add(inductor_compiled_code)
+
+    for path in _SAC_OPTIONAL_SAVE_OP_PATHS:
+        op = _resolve_torch_op(path)
+        if op is not None:
+            save_ops.add(op)
+    return save_ops
+
+
+def _create_selective_checkpoint_policy(
+    save_ops_regex: tuple[re.Pattern[str], ...],
+    save_ops: set[object],
+) -> Callable[..., CheckpointPolicy]:
+    """Build one forward/recompute-local SAC policy.
+
+    ``save_ops_regex`` is an additive escape hatch for a custom backend. Known
+    backends use exact operator identity/name matches so a broad default regex
+    cannot accidentally retain unrelated activations.
+    """
+    counters = {"forward_mm_count": 0, "recompute_mm_count": 0}
+
+    def wrapped_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
+        # Avoid repeating CUDA-to-CPU synchronization used by expert-routing
+        # metadata or similar control paths.
+        source_device = getattr(args[0], "device", None) if args else None
+        destination_device = kwargs.get("device")
+        if (
+            func == torch.ops.aten._to_copy.default
+            and str(source_device).startswith("cuda")
+            and str(destination_device) == "cpu"
+        ):
+            return CheckpointPolicy.MUST_SAVE
+
+        # PyTorch <=2.10 calls the policy in both phases and reports the phase
+        # through ``is_recompute``. PyTorch 2.13+ only calls it in forward
+        # (cached decisions are replayed by index) and deprecates the attribute
+        # as always false. This fallback supports both APIs: legacy recompute
+        # gets its own counter, while the forward-only API naturally uses just
+        # the forward counter.
+        phase = "recompute" if getattr(ctx, "is_recompute", False) else "forward"
+        mm_count_key = f"{phase}_mm_count"
+        if func in _SAC_MM_OPS:
+            counters[mm_count_key] += 1
+
+        should_save = func in save_ops
+        if not should_save:
+            op_name = str(func)
+            should_save = op_name in _SAC_EXACT_SAVE_OP_NAMES or any(
+                pattern.search(op_name) for pattern in save_ops_regex
+            )
+
+        # Match TorchTitan's memory/compute balance: keep odd-numbered matrix
+        # multiplies and recompute even-numbered ones. Forward and recompute
+        # counters are independent so their decisions stay aligned.
+        if should_save:
+            if func in _SAC_MM_OPS and counters[mm_count_key] % 2 == 0:
+                return CheckpointPolicy.PREFER_RECOMPUTE
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return wrapped_policy
 
 
 class ContextParallelDispatch(nn.Module):
@@ -229,22 +353,19 @@ def _apply_selective_ac(
     ac: ActivationCheckpointingConfig,
 ) -> nn.Module:
     """Apply per-op selective activation checkpointing to ``module``."""
-    save_ops_regex = [re.compile(pattern) for pattern in ac.save_ops_regex]
-
-    def _get_custom_policy():
-        def wrapped_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
-            op_name = getattr(func, "__name__", str(func))
-            if any(pattern.search(op_name) for pattern in save_ops_regex):
-                return CheckpointPolicy.MUST_SAVE
-            return CheckpointPolicy.MUST_RECOMPUTE
-
-        return wrapped_policy
+    save_ops_regex = tuple(re.compile(pattern) for pattern in ac.save_ops_regex)
+    save_ops = _get_default_sac_save_ops()
 
     return ptd_checkpoint_wrapper(
         module,
-        context_fn=lambda: create_selective_checkpoint_contexts(_get_custom_policy()),
+        context_fn=lambda: create_selective_checkpoint_contexts(
+            _create_selective_checkpoint_policy(save_ops_regex, save_ops)
+        ),
         preserve_rng_state=ac.preserve_rng_state,
         determinism_check=ac.determinism_check,
+        # The every-other-mm policy needs to observe the same complete op
+        # sequence in forward and recompute.
+        early_stop=False,
     )
 
 

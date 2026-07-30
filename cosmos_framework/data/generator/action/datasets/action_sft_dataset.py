@@ -19,8 +19,8 @@ from typing import Any
 
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
-from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
+from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.libero_lerobot_dataset import LIBEROLeRobotDataset
 from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
 
@@ -100,6 +100,8 @@ def get_action_droid_sft_dataset(
     action_normalization: str | None = None,
     viewpoint: str = "concat_view",
     use_image_augmentation: bool = False,
+    image_augmentation_backend: str = "cpu",
+    image_augmentation_gpu_frame_chunk: int = 8,
     use_filter_dict: bool = False,
     filter_dict_path: str | None = None,
     resolution: str | int = "256",
@@ -129,6 +131,8 @@ def get_action_droid_sft_dataset(
         use_state=use_state,
         action_normalization=action_normalization,
         use_image_augmentation=use_image_augmentation,  # i4: bundles random-crop+resize+ColorJitter
+        image_augmentation_backend=image_augmentation_backend,
+        image_augmentation_gpu_frame_chunk=image_augmentation_gpu_frame_chunk,
         use_filter_dict=use_filter_dict,
         filter_dict_path=filter_dict_path,
         use_success_only=use_success_only,
